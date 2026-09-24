@@ -6,17 +6,22 @@ import {
   verifyCapacity,
   verifyPriorityCapacity,
   suggestExpansion,
+  locateValveAnomalies,
   MAX_OPEN_VALVES,
   EXPANSION_TARGET_CAPACITY,
   MAX_EXPANSION_PIPES,
+  MAX_FLIPS,
   type Query,
   type CapacityQuery,
+  type AnomalyQuery,
   type SolveResult,
   type ResilienceResult,
   type CapacityResult,
   type PriorityCapacityResult,
   type ExpansionResult,
   type ExpansionPlan,
+  type AnomalyResult,
+  type AnomalySolution,
 } from './solver';
 import {
   SAMPLE_NETWORK,
@@ -24,6 +29,8 @@ import {
   SAMPLE_SUPPLY_CAPS,
   SAMPLE_OUTLET_DEMANDS,
   SAMPLE_PRIORITY_OUTLETS,
+  SAMPLE_WET_NODES,
+  SAMPLE_DRY_NODES,
 } from './sample';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
@@ -37,6 +44,7 @@ app.innerHTML = `
       还可做「供水能力核验」（按供给上限与出口需求量求总供给最大分配、缺口与限制总供给的最小割），
       可将部分保供出口标为「重点」做「重点出口优先配水」（先让重点出口总获配最大，再在此前提下让全部出口总获配最大），
       并能给出「管段增容建议」（在当前阀门状态下枚举将参与输水管段容量由 1 提至 2 的改造方案，最多改造两条）。
+      还可根据现场有水 / 无水观测做「阀门状态异常定位」（以登记的阀门开闭状态为基线，枚举最多 ${MAX_FLIPS} 处状态翻转来解释全部观测）。
       组合搜索最多覆盖 ${MAX_OPEN_VALVES} 个当前开启的阀门；求解过程不修改输入中的阀门状态。
     </p>
   </header>
@@ -96,6 +104,25 @@ app.innerHTML = `
         已关阀及自环不可选。分别计算不改造、单条与两条组合的总获配量，按
         「总获配量最高 → 改造条数最少 → 管段编号列表字典序最小」推荐方案。
       </p>
+      <h2>4. 阀门状态异常定位</h2>
+      <p class="hint">
+        沿用上方拓扑与供水点：把现场观测到的<strong>有水</strong> / <strong>无水</strong>节点分别填入，
+        以登记的各带阀管段开闭状态为基线，枚举最多 ${MAX_FLIPS} 处状态翻转（开↔关，已关阀也可被翻为开），
+        找出能同时解释全部观测的候选——有水节点须可达任一供水点、无水节点须不可达；只用已观测节点判定匹配。
+      </p>
+      <div class="fields">
+        <label>
+          现场有水节点（多个用逗号分隔）
+          <input id="wet-nodes" type="text" placeholder="如：咖啡厅, 卫生间" />
+        </label>
+        <label>
+          现场无水节点（多个用逗号分隔）
+          <input id="dry-nodes" type="text" placeholder="如：展厅B" />
+        </label>
+      </div>
+      <div class="button-row">
+        <button id="locate-anomaly" type="button" class="secondary">定位异常阀门</button>
+      </div>
     </section>
     <div class="side-column">
       <section class="panel result-panel">
@@ -139,6 +166,15 @@ app.innerHTML = `
           </p>
         </div>
       </section>
+      <section class="panel result-panel">
+        <h2>阀门状态异常定位</h2>
+        <div id="anomaly-result">
+          <p class="hint">
+            在左侧填写现场有水 / 无水观测节点后点击「定位异常阀门」，这里列出翻转数最少的全部匹配方案
+            （被翻转的阀门及翻转后的开闭状态）；零翻转表示登记状态与现场一致，无匹配表示两处以内无法解释。
+          </p>
+        </div>
+      </section>
     </div>
   </main>
 `;
@@ -153,12 +189,15 @@ const topologyEl = el<HTMLTextAreaElement>('#topology');
 const suppliesEl = el<HTMLInputElement>('#supplies');
 const leakEl = el<HTMLInputElement>('#leak');
 const outletsEl = el<HTMLInputElement>('#outlets');
+const wetNodesEl = el<HTMLInputElement>('#wet-nodes');
+const dryNodesEl = el<HTMLInputElement>('#dry-nodes');
 const resultEl = el<HTMLDivElement>('#result');
 const inspectResultEl = el<HTMLDivElement>('#inspect-result');
 const capacityFormEl = el<HTMLDivElement>('#capacity-form');
 const capacityResultEl = el<HTMLDivElement>('#capacity-result');
 const priorityResultEl = el<HTMLDivElement>('#priority-result');
 const expansionResultEl = el<HTMLDivElement>('#expansion-result');
+const anomalyResultEl = el<HTMLDivElement>('#anomaly-result');
 
 /** 已生成填写表对应的供水点 / 保供出口。 */
 interface CapacityFormState {
@@ -651,6 +690,75 @@ function renderExpansion(result: ExpansionResult): void {
     </p>`;
 }
 
+function renderAnomaly(result: AnomalyResult): void {
+  if (result.status === 'invalid') {
+    renderErrors(anomalyResultEl, '输入有误，无法定位：', result.errors);
+    return;
+  }
+  if (result.status === 'no-match') {
+    anomalyResultEl.innerHTML = `
+      <div class="banner error">无匹配：${MAX_FLIPS} 处以内翻转无法解释现场观测。</div>
+      <p>${escapeHtml(result.reason)}</p>
+      <p class="hint">参与枚举的阀门数：${result.valveCount}（全部带阀管段，登记为开或关均可翻转）。</p>`;
+    return;
+  }
+
+  const stateTag = (open: boolean): string =>
+    open ? '<span class="tag tag-ok">开</span>' : '<span class="tag tag-cut">关</span>';
+  /** 翻转描述，如「V08（开→关）」；id 已转义。 */
+  const flipText = (sol: AnomalySolution): string =>
+    sol.flipped
+      .map((id) => {
+        const row = sol.valveStates.find((v) => v.id === id)!;
+        return `${escapeHtml(id)}（${row.registeredOpen ? '开' : '关'}→${row.actualOpen ? '开' : '关'}）`;
+      })
+      .join('、');
+
+  const banner =
+    result.minFlips === 0
+      ? '登记状态与现场观测一致：<strong>0 处翻转</strong>即可解释全部观测，登记的阀门开闭状态无需修正。'
+      : `找到 ${result.solutions.length}${result.truncated ? '+' : ''} 个匹配方案：
+         最少需翻转 <strong>${result.minFlips}</strong> 处阀门状态。
+         推荐方案（同数按阀门编号字典序最小）：翻转 ${flipText(result.solutions[0])}`;
+
+  anomalyResultEl.innerHTML = `
+    <div class="banner success">${banner}</div>
+    <p class="hint">
+      参与枚举的阀门数：${result.valveCount}（全部带阀管段，开、关状态均可翻转）；
+      仅按已观测节点判定匹配，未观测节点的通水状态不参与；输入拓扑与登记开闭状态不会被修改。
+    </p>
+    ${result.solutions
+      .map(
+        (sol, i) => `
+      <details class="solution" ${i === 0 ? 'open' : ''}>
+        <summary>
+          方案 ${i + 1}：翻转 ${sol.flipped.length} 处
+          ${sol.flipped.length > 0 ? `（${flipText(sol)}）` : '（登记状态一致）'}
+        </summary>
+        <table>
+          <thead>
+            <tr><th>阀门</th><th>登记状态</th><th>翻转后状态</th><th>判定</th></tr>
+          </thead>
+          <tbody>
+            ${sol.valveStates
+              .map(
+                (v) => `
+              <tr>
+                <td><code>${escapeHtml(v.id)}</code></td>
+                <td>${stateTag(v.registeredOpen)}</td>
+                <td>${stateTag(v.actualOpen)}</td>
+                <td>${v.flipped ? '<span class="tag tag-low">已翻转</span>' : '<span class="hint">一致</span>'}</td>
+              </tr>`
+              )
+              .join('')}
+          </tbody>
+        </table>
+      </details>`
+      )
+      .join('')}
+    ${result.truncated ? '<p class="hint">匹配方案过多，仅展示前 100 个。</p>' : ''}`;
+}
+
 function readNetwork(): import('./solver').Network {
   let raw: unknown;
   try {
@@ -767,11 +875,28 @@ function runPriorityCapacity(): void {
   }
 }
 
+function runAnomaly(): void {
+  try {
+    const network = readNetwork();
+    // 异常定位沿用上方「供水点」，不依赖漏点与保供出口
+    const anomalyQuery: AnomalyQuery = {
+      supplies: splitList(suppliesEl.value),
+      wetNodes: splitList(wetNodesEl.value),
+      dryNodes: splitList(dryNodesEl.value),
+    };
+    renderAnomaly(locateValveAnomalies(network, anomalyQuery));
+  } catch (e) {
+    renderErrors(anomalyResultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+  }
+}
+
 el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   topologyEl.value = JSON.stringify(SAMPLE_NETWORK, null, 2);
   suppliesEl.value = SAMPLE_QUERY.supplies.join(', ');
   leakEl.value = SAMPLE_QUERY.leak;
   outletsEl.value = SAMPLE_QUERY.outlets.join(', ');
+  wetNodesEl.value = SAMPLE_WET_NODES.join(', ');
+  dryNodesEl.value = SAMPLE_DRY_NODES.join(', ');
   buildCapacityForm(
     SAMPLE_QUERY.supplies,
     SAMPLE_QUERY.outlets,
@@ -784,6 +909,7 @@ el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   runCapacity();
   runPriorityCapacity();
   runExpansion();
+  runAnomaly();
 });
 
 el<HTMLButtonElement>('#solve').addEventListener('click', run);
@@ -791,6 +917,7 @@ el<HTMLButtonElement>('#inspect').addEventListener('click', runInspection);
 el<HTMLButtonElement>('#verify-capacity').addEventListener('click', runCapacity);
 el<HTMLButtonElement>('#priority-capacity').addEventListener('click', runPriorityCapacity);
 el<HTMLButtonElement>('#suggest-expansion').addEventListener('click', runExpansion);
+el<HTMLButtonElement>('#locate-anomaly').addEventListener('click', runAnomaly);
 el<HTMLButtonElement>('#build-capacity-form').addEventListener('click', () => {
   try {
     readNetwork(); // 仅校验拓扑 JSON，核验不依赖漏点

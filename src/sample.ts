@@ -54,3 +54,12 @@ export const SAMPLE_OUTLET_DEMANDS: Record<string, number> = {
 
 /** 示例重点出口优先配水：展厅B 为重点保供出口，其余为普通。 */
 export const SAMPLE_PRIORITY_OUTLETS: string[] = ['展厅B'];
+
+/** 示例阀门状态异常定位：现场观测有水的节点。 */
+export const SAMPLE_WET_NODES: string[] = ['咖啡厅', '卫生间'];
+
+/**
+ * 示例阀门状态异常定位：现场观测无水的节点。
+ * 登记状态中展厅B 经 V08 供水（应为有水），现场却无水 → 可定位为 V08 实际已关。
+ */
+export const SAMPLE_DRY_NODES: string[] = ['展厅B'];

@@ -600,5 +600,109 @@ check('缺少供水点被拒绝', ee3.status === 'invalid');
 const ee4 = exp(network, ['NOPE'], ['B'], { NOPE: 1 }, { B: 1 });
 check('供水点不存在时报错', ee4.status === 'invalid');
 
+// ============ 阀门状态异常定位 ============
+console.log('阀门状态异常定位：');
+
+// 登记状态下全部节点均可达 S1/S2（V09 虽关，B 仍经 V08 连通）：
+// 观测 B、C 有水与登记一致 → 零翻转
+const a0 = solver.locateValveAnomalies(network, { supplies: ['S1', 'S2'], wetNodes: ['B', 'C'], dryNodes: [] });
+check('零翻转：登记状态与观测一致', a0.status === 'ok' && a0.minFlips === 0 &&
+  a0.solutions.length === 1 && a0.solutions[0].flipped.length === 0);
+check('零翻转方案的翻转后状态与登记一致', a0.solutions[0].valveStates.every(
+  (v) => v.actualOpen === v.registeredOpen && !v.flipped
+));
+
+// B 现场无水：登记中 B 仅经 V08（V09 已关）连网，唯一单翻转解释为 V08 实际已关
+const a1 = solver.locateValveAnomalies(network, { supplies: ['S1', 'S2'], wetNodes: ['C', 'D'], dryNodes: ['B'] });
+check('单翻转唯一定位 V08', a1.status === 'ok' && a1.minFlips === 1 &&
+  a1.solutions.length === 1 && a1.solutions[0].flipped.join(',') === 'V08');
+const v08row = a1.solutions[0].valveStates.find((v) => v.id === 'V08');
+check('翻转后 V08 实际为关且标记已翻转', v08row.registeredOpen === true && v08row.actualOpen === false && v08row.flipped === true);
+const v09row = a1.solutions[0].valveStates.find((v) => v.id === 'V09');
+check('V09 保持登记关闭且未翻转', v09row.registeredOpen === false && v09row.actualOpen === false && !v09row.flipped);
+check('翻转后状态表按阀门编号升序', a1.solutions[0].valveStates.map((v) => v.id).join(',') ===
+  network.valvedPipes.map((v) => v.id).sort().join(','));
+
+console.log('异常定位：已关阀可被翻转为开：');
+// O 仅经已关阀 V2 挂网，现场观测 O 有水 → 必须翻转 V2（关→开）
+const closedOnlyNet = {
+  nodes: ['S', 'X', 'O'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'X', open: true },
+    { id: 'V2', from: 'X', to: 'O', open: false },
+  ],
+};
+const a2 = solver.locateValveAnomalies(closedOnlyNet, { supplies: ['S'], wetNodes: ['O'], dryNodes: [] });
+check('翻转已关阀 V2 解释观测', a2.status === 'ok' && a2.minFlips === 1 &&
+  a2.solutions.length === 1 && a2.solutions[0].flipped.join(',') === 'V2');
+check('翻转后 V2 实际为开', a2.solutions[0].valveStates.find((v) => v.id === 'V2').actualOpen === true);
+
+console.log('异常定位：两处翻转才能解释：');
+// 菱形 S—V1—A，A—V2—B，A—V3—O，B—V4—O：观测 O 有水、B 无水，
+// 须同时切断 B 的两条连接 V2、V4（单翻任意一条 B 仍经另一条连通）
+const twoFlipNet = {
+  nodes: ['S', 'A', 'B', 'O'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'A', open: true },
+    { id: 'V2', from: 'A', to: 'B', open: true },
+    { id: 'V3', from: 'A', to: 'O', open: true },
+    { id: 'V4', from: 'B', to: 'O', open: true },
+  ],
+};
+const a3 = solver.locateValveAnomalies(twoFlipNet, { supplies: ['S'], wetNodes: ['O'], dryNodes: ['B'] });
+check('两处翻转唯一方案 [V2,V4]', a3.status === 'ok' && a3.minFlips === 2 &&
+  a3.solutions.length === 1 && a3.solutions[0].flipped.join(',') === 'V2,V4');
+
+console.log('异常定位：同数翻转列出全部方案且按字典序：');
+// 链 S—V1—M—V2—O，仅观测 O 无水：翻 V1 或 V2 均可解释
+const chainNet = {
+  nodes: ['S', 'M', 'O'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'M', open: true },
+    { id: 'V2', from: 'M', to: 'O', open: true },
+  ],
+};
+const a5 = solver.locateValveAnomalies(chainNet, { supplies: ['S'], wetNodes: [], dryNodes: ['O'] });
+check('两个等价单翻转方案均列出', a5.status === 'ok' && a5.minFlips === 1 && a5.solutions.length === 2);
+check('方案按阀门编号字典序排列', a5.solutions[0].flipped[0] === 'V1' && a5.solutions[1].flipped[0] === 'V2');
+
+console.log('异常定位：无匹配与未观测节点不参与判定：');
+// O 经无阀管段 P1 与 S 直连，观测 O 无水：任何阀门翻转都无法解释
+const noMatchNet = {
+  nodes: ['S', 'O'],
+  pipes: [{ id: 'P1', from: 'S', to: 'O' }],
+  valvedPipes: [{ id: 'V1', from: 'S', to: 'O', open: true }],
+};
+const a4 = solver.locateValveAnomalies(noMatchNet, { supplies: ['S'], wetNodes: [], dryNodes: ['O'] });
+check('两处以内无法解释时返回 no-match', a4.status === 'no-match' && a4.valveCount === 1);
+// 未观测节点不参与：观测点仅为 B（无水），其余节点状态不影响判定
+const a6 = solver.locateValveAnomalies(network, { supplies: ['S1', 'S2'], wetNodes: [], dryNodes: ['B'] });
+check('只用已观测节点判定（仅 B 无水仍定位 V08）', a6.status === 'ok' && a6.minFlips === 1 &&
+  a6.solutions.length === 1 && a6.solutions[0].flipped.join(',') === 'V08');
+
+console.log('异常定位：校验与纯函数：');
+const ae1 = solver.locateValveAnomalies(network, { supplies: ['NOPE'], wetNodes: ['B'], dryNodes: [] });
+check('供水点不存在时报错', ae1.status === 'invalid');
+const ae2 = solver.locateValveAnomalies(network, { supplies: ['S1'], wetNodes: ['NOPE'], dryNodes: [] });
+check('有水观测节点不存在时报错', ae2.status === 'invalid');
+const ae3 = solver.locateValveAnomalies(network, { supplies: ['S1'], wetNodes: [], dryNodes: ['NOPE'] });
+check('无水观测节点不存在时报错', ae3.status === 'invalid');
+const ae4 = solver.locateValveAnomalies(network, { supplies: ['S1'], wetNodes: ['B'], dryNodes: ['B'] });
+check('同一节点同时有水无水判定冲突', ae4.status === 'invalid' && ae4.errors.some((e) => e.includes('冲突')));
+const ae5 = solver.locateValveAnomalies(network, { supplies: [], wetNodes: ['B'], dryNodes: [] });
+check('缺少供水点时报错', ae5.status === 'invalid');
+const ae6 = solver.locateValveAnomalies(network, { supplies: ['S1'], wetNodes: [], dryNodes: [] });
+check('没有任何观测节点时报错', ae6.status === 'invalid');
+const ae7 = solver.locateValveAnomalies(network, { supplies: ['S1'], wetNodes: [], dryNodes: ['S1'] });
+check('供水点登记为无水判定冲突', ae7.status === 'invalid' && ae7.errors.some((e) => e.includes('恒有水')));
+const ae8 = solver.locateValveAnomalies(network, { supplies: ['S1'], wetNodes: ['B', 'B'], dryNodes: ['C', 'C'] });
+check('重复观测节点去重后不报错', ae8.status === 'ok');
+const beforeAnom = JSON.stringify(network);
+solver.locateValveAnomalies(network, { supplies: ['S1', 'S2'], wetNodes: ['C'], dryNodes: ['B'] });
+check('异常定位不修改输入网络', JSON.stringify(network) === beforeAnom);
+
 console.log(`\n${passed} 通过, ${failed} 失败`);
 process.exit(failed > 0 ? 1 : 0);
