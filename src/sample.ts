@@ -54,3 +54,11 @@ export const SAMPLE_OUTLET_DEMANDS: Record<string, number> = {
 
 /** 示例重点出口优先配水：展厅B 为重点保供出口，其余为普通。 */
 export const SAMPLE_PRIORITY_OUTLETS: string[] = ['展厅B'];
+
+/**
+ * 示例阀门状态异常定位的现场观测：
+ * 登记状态下所有节点均由两路供水连通；现场发现展厅B 无水而其余点仍有水，
+ * 唯一解释是展厅B 仅剩的连通阀 V08（V09 登记为关）实际被关闭，即 V08 一处翻转。
+ */
+export const SAMPLE_ANOMALY_WET: string[] = ['咖啡厅', '卫生间', '展厅A', '环管N2'];
+export const SAMPLE_ANOMALY_DRY: string[] = ['展厅B'];

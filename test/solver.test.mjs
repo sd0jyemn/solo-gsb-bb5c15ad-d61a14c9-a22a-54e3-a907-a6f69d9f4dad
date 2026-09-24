@@ -600,5 +600,132 @@ check('缺少供水点被拒绝', ee3.status === 'invalid');
 const ee4 = exp(network, ['NOPE'], ['B'], { NOPE: 1 }, { B: 1 });
 check('供水点不存在时报错', ee4.status === 'invalid');
 
+// ============ 阀门状态异常定位 ============
+console.log('阀门状态异常定位：');
+
+// 基线（全部阀门除 V09 外开启）：所有节点均可达任一供水点
+const a0 = solver.locateAnomaly(network, { supplies: ['S1', 'S2'], wetNodes: ['B', 'C', 'N2'], dryNodes: [] });
+check('登记状态与观测一致时零翻转匹配', a0.status === 'ok' && a0.minFlips === 0);
+check('零翻转方案 flipped 为空清单', a0.plans[0].flipped.length === 0);
+check('零翻转方案 valveStates 保持登记状态',
+  a0.plans[0].valveStates.every((v) => v.open === v.registeredOpen && !v.flipped));
+check('零翻转方案观测全部匹配', a0.plans[0].observations.every((o) => o.match));
+check('零翻转方案可达供水点明细（B 可达 S1）',
+  a0.plans[0].observations.find((o) => o.node === 'B').reachableSupplies.includes('S1'));
+
+console.log('异常定位：单处翻转（开变关）：');
+// B 仅经 V08 挂网（V09 登记为关）；B 无水、环上其他点仍有水 → V08 被误开登记
+const a1 = solver.locateAnomaly(network, {
+  supplies: ['S1', 'S2'], wetNodes: ['C', 'D', 'N1', 'N2', 'N3', 'N4', 'A'], dryNodes: ['B'],
+});
+check('返回 ok 且最少翻转 1 处', a1.status === 'ok' && a1.minFlips === 1);
+check('唯一匹配方案为翻转 V08', a1.plans.length === 1 && a1.plans[0].flipped.join(',') === 'V08');
+const a1plan = a1.plans[0];
+check('V08 翻转后为关', a1plan.valveStates.find((v) => v.id === 'V08').open === false);
+check('V08 标记 flipped', a1plan.valveStates.find((v) => v.id === 'V08').flipped === true);
+check('V09 未翻转、保持关闭',
+  !a1plan.valveStates.find((v) => v.id === 'V09').flipped &&
+  a1plan.valveStates.find((v) => v.id === 'V09').open === false);
+check('其余阀门状态不变', a1plan.valveStates.filter((v) => v.id !== 'V08').every((v) => v.open === v.registeredOpen));
+check('有水观测判可达、无水观测判不可达',
+  a1plan.observations.every((o) => (o.observed === 'wet' ? o.reachable : !o.reachable)));
+
+console.log('异常定位：单处翻转（关变开）：');
+// 构造实际 V09 也开启（仍解释不了 B 无水，反例）—— 取相反观测：
+// 若现场 B 有水（登记下也有水，V08 连通），换网络使 B 仅经关闭阀连接
+const closedOnlyNet = {
+  nodes: ['S1', 'S2', 'B'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S1', to: 'B', open: false },
+    { id: 'V2', from: 'S2', to: 'B', open: false },
+  ],
+};
+const a2 = solver.locateAnomaly(closedOnlyNet, { supplies: ['S1', 'S2'], wetNodes: ['B'], dryNodes: [] });
+check('登记全关但现场有水 → 最少 1 处翻转', a2.status === 'ok' && a2.minFlips === 1);
+check('两个等优方案 [V1]、[V2] 均列出且字典序排列',
+  a2.plans.length === 2 && a2.plans[0].flipped[0] === 'V1' && a2.plans[1].flipped[0] === 'V2');
+check('方案中翻转阀门由关变开', a2.plans[0].valveStates.find((v) => v.id === 'V1').open === true);
+
+console.log('异常定位：必须两处翻转：');
+// 双支路：S—V1—A—V2—X 与 S—V3—B—V4—X，登记四阀均开。
+// 观测 X、A 有水而 B 无水：B 经 V3（通 S）与 V4（通 X）双侧进水，
+// 必须 V3、V4 同时关闭（两处翻转）；单关任一阀 B 仍可从另一侧得水。
+const branchNet = {
+  nodes: ['S', 'A', 'B', 'X'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'A', open: true },
+    { id: 'V2', from: 'A', to: 'X', open: true },
+    { id: 'V3', from: 'S', to: 'B', open: true },
+    { id: 'V4', from: 'B', to: 'X', open: true },
+  ],
+};
+const a3 = solver.locateAnomaly(branchNet, { supplies: ['S'], wetNodes: ['A', 'X'], dryNodes: ['B'] });
+check('返回 ok 且最少翻转 2 处', a3.status === 'ok' && a3.minFlips === 2);
+check('唯一匹配方案为翻转 [V3,V4]', a3.plans.length === 1 && a3.plans[0].flipped.join(',') === 'V3,V4');
+check('方案中 V3、V4 翻转后为关，V1、V2 保持开',
+  a3.plans[0].valveStates.every((v) =>
+    v.id === 'V3' || v.id === 'V4' ? !v.open && v.flipped : v.open && !v.flipped));
+
+console.log('异常定位：只用已观测节点判定（未观测节点不参与）：');
+// 仅观测 B 无水；C/D/A 等是否有水未知，不应参与匹配
+const a4 = solver.locateAnomaly(network, { supplies: ['S1', 'S2'], wetNodes: [], dryNodes: ['B'] });
+check('只观测一个无水节点也可定位（1 处翻转 V08）',
+  a4.status === 'ok' && a4.minFlips === 1 && a4.plans[0].flipped[0] === 'V08');
+// 但翻转其他阀门若恰好也使 B 无水也应列出：B 仅经 V08 连通，唯有 V08 翻转可行
+check('单节点观测下方案仍唯一', a4.plans.length === 1);
+
+console.log('异常定位：无阀管段恒通、无匹配提示：');
+// A 经无阀管段 P1 直挂 N2：任何阀门翻转都无法让 A 单独无水（无阀管段不可翻转）
+const a5 = solver.locateAnomaly(network, {
+  supplies: ['S1', 'S2'], wetNodes: ['N2'], dryNodes: ['A'],
+});
+check('无阀管段连接的节点无法通过翻转阀门变无水 → 无匹配', a5.status === 'no-solution');
+check('无匹配原因包含两处以内无法解释的提示', a5.reason.includes('2'));
+
+console.log('异常定位：两处以内无法解释（需 3 处）：');
+// 供水点经三条独立阀管给同一节点供水：三条全关才无水 → 需 3 处翻转
+const tripleNet = {
+  nodes: ['S1', 'S2', 'S3', 'O'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S1', to: 'O', open: true },
+    { id: 'V2', from: 'S2', to: 'O', open: true },
+    { id: 'V3', from: 'S3', to: 'O', open: true },
+  ],
+};
+const a6 = solver.locateAnomaly(tripleNet, { supplies: ['S1', 'S2', 'S3'], wetNodes: [], dryNodes: ['O'] });
+check('三条阀管全关才无水，两处翻转不够 → 无匹配', a6.status === 'no-solution');
+
+console.log('异常定位：校验输入：');
+const ae1 = solver.locateAnomaly(network, { supplies: ['NOPE'], wetNodes: ['B'], dryNodes: [] });
+check('供水点不存在时报错', ae1.status === 'invalid');
+const ae2 = solver.locateAnomaly(network, { supplies: ['S1'], wetNodes: ['NOPE'], dryNodes: [] });
+check('有水节点不存在时报错', ae2.status === 'invalid');
+const ae3 = solver.locateAnomaly(network, { supplies: ['S1'], wetNodes: [], dryNodes: ['NOPE'] });
+check('无水节点不存在时报错', ae3.status === 'invalid');
+const ae4 = solver.locateAnomaly(network, { supplies: ['S1'], wetNodes: ['B'], dryNodes: ['B'] });
+check('两组观测冲突（同节点既有水又无水）时报错', ae4.status === 'invalid' &&
+  ae4.errors.some((e) => e.includes('同时登记')));
+const ae5 = solver.locateAnomaly(network, { supplies: [], wetNodes: ['B'], dryNodes: [] });
+check('缺少供水点时报错', ae5.status === 'invalid');
+const ae6 = solver.locateAnomaly(network, { supplies: ['S1'], wetNodes: [], dryNodes: [] });
+check('没有任何观测节点时报错', ae6.status === 'invalid');
+const ae7 = solver.locateAnomaly(network, { supplies: 'S1', wetNodes: [], dryNodes: [] });
+check('字段不是数组时报错', ae7.status === 'invalid');
+
+console.log('异常定位：纯函数，输入与原拓扑不变：');
+const beforeAnom = JSON.stringify(network);
+solver.locateAnomaly(network, { supplies: ['S1', 'S2'], wetNodes: ['C'], dryNodes: ['B'] });
+check('定位不修改输入网络', JSON.stringify(network) === beforeAnom);
+const aq = { supplies: ['S1', 'S2'], wetNodes: ['C'], dryNodes: ['B'] };
+const beforeAnomQ = JSON.stringify(aq);
+solver.locateAnomaly(network, aq);
+check('定位不修改查询对象', JSON.stringify(aq) === beforeAnomQ);
+// 观测名单重复时按去重处理
+const ae8 = solver.locateAnomaly(network, { supplies: ['S1', 'S1'], wetNodes: ['C', 'C'], dryNodes: ['B', 'B'] });
+check('重复供水点 / 观测节点去重处理', ae8.status === 'ok');
+
 console.log(`\n${passed} 通过, ${failed} 失败`);
 process.exit(failed > 0 ? 1 : 0);

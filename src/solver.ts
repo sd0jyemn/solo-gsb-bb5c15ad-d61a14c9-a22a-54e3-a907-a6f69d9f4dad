@@ -274,10 +274,83 @@ export interface ExpansionInvalid {
 
 export type ExpansionResult = ExpansionOk | ExpansionInvalid;
 
+// ============ 阀门状态异常定位 ============
+
+/** 单个候选方案允许翻转（开闭反转）的带阀管段数量上限。 */
+export const MAX_ANOMALY_FLIPS = 2;
+
+export interface AnomalyQuery {
+  /** 供水点节点 */
+  supplies: string[];
+  /** 现场观测到「有水」的节点 */
+  wetNodes: string[];
+  /** 现场观测到「无水」的节点 */
+  dryNodes: string[];
+}
+
+/** 翻转方案下单个带阀管段的开闭状态。 */
+export interface AnomalyValveState {
+  id: string;
+  from: string;
+  to: string;
+  /** 拓扑 JSON 中登记的开闭状态 */
+  registeredOpen: boolean;
+  /** 翻转后的开闭状态 */
+  open: boolean;
+  /** 本方案中该阀门是否发生翻转 */
+  flipped: boolean;
+}
+
+/** 已观测节点在某候选方案下的判定情况。 */
+export interface AnomalyObservation {
+  node: string;
+  /** 现场观测：有水 / 无水 */
+  observed: 'wet' | 'dry';
+  /** 按候选开闭状态计算：该节点是否能连通至少一个供水点 */
+  reachable: boolean;
+  /** 该节点可连通的供水点（无水判定时为空清单） */
+  reachableSupplies: string[];
+  /** 计算结果与现场观测是否一致 */
+  match: boolean;
+}
+
+export interface AnomalyPlan {
+  /** 发生状态翻转的阀门编号（升序）；零翻转时为空清单 */
+  flipped: string[];
+  /** 翻转后全部带阀管段的开闭状态（按拓扑登记顺序） */
+  valveStates: AnomalyValveState[];
+  /** 仅针对已观测节点的判定明细（先有水、后无水，各组内按输入顺序去重） */
+  observations: AnomalyObservation[];
+}
+
+export interface AnomalyOk {
+  status: 'ok';
+  /** 最少翻转数（0 表示登记状态本身即与观测一致） */
+  minFlips: number;
+  /** 翻转数最少的全部匹配方案，按翻转阀门编号（升序）列表的字典序排列 */
+  plans: AnomalyPlan[];
+  /** 匹配方案总数超过展示上限时为 true */
+  truncated: boolean;
+}
+
+export interface AnomalyNoSolution {
+  status: 'no-solution';
+  reason: string;
+}
+
+export interface AnomalyInvalid {
+  status: 'invalid';
+  errors: string[];
+}
+
+export type AnomalyResult = AnomalyOk | AnomalyNoSolution | AnomalyInvalid;
+
 /** 参与组合的开启阀门数量上限 */
 export const MAX_OPEN_VALVES = 12;
 /** 收集的最优方案数上限（防止结果爆炸） */
 export const MAX_SOLUTIONS = 100;
+/** 阀门状态异常定位展示的匹配方案数上限 */
+export const MAX_ANOMALY_SOLUTIONS = 100;
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -1334,5 +1407,192 @@ export function suggestExpansion(network: Network, query: CapacityQuery): Expans
     recommended,
     bestSingle,
     bestPair,
+  };
+}
+
+/**
+ * 阀门状态异常定位：以拓扑 JSON 中登记的各带阀管段开闭状态为基线，
+ * 枚举至多 MAX_ANOMALY_FLIPS 处阀门状态翻转（开→关或关→开）。
+ * 对每个候选，按「无阀管段 + 翻转后实际开启的带阀管段」计算各节点对
+ * 任一供水点的可达性，仅以现场已观测节点（有水 / 无水）判定是否匹配，
+ * 未观测节点一律不参与判定。返回翻转数最少的全部匹配方案及翻转后的开闭状态。
+ *
+ * 纯函数，不修改输入网络与查询。
+ */
+export function locateAnomaly(network: Network, query: AnomalyQuery): AnomalyResult {
+  const errors: string[] = [];
+  const nodeSet = new Set(network.nodes);
+
+  if (!asStringArray(query.supplies)) errors.push('供水点必须是字符串数组。');
+  if (!asStringArray(query.wetNodes)) errors.push('现场有水节点必须是字符串数组。');
+  if (!asStringArray(query.dryNodes)) errors.push('现场无水节点必须是字符串数组。');
+  if (errors.length > 0) return { status: 'invalid', errors };
+
+  const supplies = uniquePreservingOrder(query.supplies as string[]);
+  const wetNodes = uniquePreservingOrder(query.wetNodes as string[]);
+  const dryNodes = uniquePreservingOrder(query.dryNodes as string[]);
+
+  if (supplies.length === 0) errors.push('至少需要指定一个供水点。');
+  for (const s of supplies) {
+    if (!nodeSet.has(s)) errors.push(`供水点「${s}」不在节点列表中。`);
+  }
+  if (wetNodes.length + dryNodes.length === 0) {
+    errors.push('至少需要填写一个现场观测节点（有水或无水）。');
+  }
+  for (const n of wetNodes) {
+    if (!nodeSet.has(n)) errors.push(`现场有水节点「${n}」不在节点列表中。`);
+  }
+  for (const n of dryNodes) {
+    if (!nodeSet.has(n)) errors.push(`现场无水节点「${n}」不在节点列表中。`);
+  }
+  const wetSet = new Set(wetNodes);
+  for (const n of dryNodes) {
+    if (wetSet.has(n)) errors.push(`节点「${n}」不能同时登记为现场有水和现场无水。`);
+  }
+  if (errors.length > 0) return { status: 'invalid', errors };
+
+  const indexOf = new Map<string, number>();
+  network.nodes.forEach((node, i) => indexOf.set(node, i));
+  const supplyIdx = new Set(supplies.map((s) => indexOf.get(s)!));
+
+  const valves = network.valvedPipes;
+  const n = valves.length;
+
+  /** 按给定翻转集合构建邻接表（无阀管段恒通，带阀管段仅翻转后开启者连通）。 */
+  const buildAdjFor = (flipped: ReadonlySet<number>): number[][] => {
+    const adj: number[][] = Array.from({ length: network.nodes.length }, () => []);
+    const addEdge = (a: string, b: string) => {
+      const u = indexOf.get(a)!;
+      const v = indexOf.get(b)!;
+      adj[u].push(v);
+      adj[v].push(u);
+    };
+    for (const p of network.pipes) addEdge(p.from, p.to);
+    valves.forEach((vp, i) => {
+      const open = flipped.has(i) ? !vp.open : vp.open;
+      if (open) addEdge(vp.from, vp.to);
+    });
+    return adj;
+  };
+
+  /** 多供水点联合遍历，返回每个节点是否能连通至少一个供水点。 */
+  const reachableFromAny = (adj: number[][]): boolean[] => {
+    const seen = new Array<boolean>(network.nodes.length).fill(false);
+    const queue: number[] = [];
+    for (const s of supplyIdx) {
+      if (!seen[s]) {
+        seen[s] = true;
+        queue.push(s);
+      }
+    }
+    while (queue.length > 0) {
+      const cur = queue.shift()!;
+      for (const next of adj[cur]) {
+        if (!seen[next]) {
+          seen[next] = true;
+          queue.push(next);
+        }
+      }
+    }
+    return seen;
+  };
+
+  /** 候选匹配：有水节点必须可达至少一个供水点，无水节点必须全部不可达；其余节点不参与。 */
+  const matches = (reachable: boolean[]): boolean => {
+    for (const w of wetNodes) {
+      if (!reachable[indexOf.get(w)!]) return false;
+    }
+    for (const d of dryNodes) {
+      if (reachable[indexOf.get(d)!]) return false;
+    }
+    return true;
+  };
+
+  // 翻转数从 0 到上限依次枚举（阀门按拓扑登记顺序编号，同数下组合天然按索引升序生成）
+  for (let k = 0; k <= Math.min(MAX_ANOMALY_FLIPS, n); k++) {
+    const plans: AnomalyPlan[] = [];
+    let truncated = false;
+    const idx = Array.from({ length: k }, (_, i) => i);
+    while (true) {
+      const flippedIdx = new Set(k === 0 ? [] : idx);
+      const adj = buildAdjFor(flippedIdx);
+      if (matches(reachableFromAny(adj))) {
+        if (plans.length < MAX_ANOMALY_SOLUTIONS) {
+          const flippedIds = [...flippedIdx].map((i) => valves[i].id).sort();
+          // 各观测节点可连通的供水点明细（按各供水点分别遍历）
+          const reachBySupply = new Map<string, Set<number>>();
+          for (const s of supplies) {
+            const seen = new Array<boolean>(network.nodes.length).fill(false);
+            const start = indexOf.get(s)!;
+            seen[start] = true;
+            const queue = [start];
+            while (queue.length > 0) {
+              const cur = queue.shift()!;
+              for (const next of adj[cur]) {
+                if (!seen[next]) {
+                  seen[next] = true;
+                  queue.push(next);
+                }
+              }
+            }
+            const reached = new Set<number>();
+            seen.forEach((v, i) => {
+              if (v) reached.add(i);
+            });
+            reachBySupply.set(s, reached);
+          }
+          const observationOf = (node: string, observed: 'wet' | 'dry'): AnomalyObservation => {
+            const nodeIdx = indexOf.get(node)!;
+            const reachableSupplies = supplies.filter((s) => reachBySupply.get(s)!.has(nodeIdx));
+            const reachable = reachableSupplies.length > 0;
+            return {
+              node,
+              observed,
+              reachable,
+              reachableSupplies,
+              match: observed === 'wet' ? reachable : !reachable,
+            };
+          };
+          const valveStates: AnomalyValveState[] = valves.map((vp, i) => {
+            const flipped = flippedIdx.has(i);
+            return {
+              id: vp.id,
+              from: vp.from,
+              to: vp.to,
+              registeredOpen: vp.open,
+              open: flipped ? !vp.open : vp.open,
+              flipped,
+            };
+          });
+          plans.push({
+            flipped: flippedIds,
+            valveStates,
+            observations: [
+              ...wetNodes.map((node) => observationOf(node, 'wet')),
+              ...dryNodes.map((node) => observationOf(node, 'dry')),
+            ],
+          });
+        } else {
+          truncated = true;
+        }
+      }
+      if (k === 0) break;
+      // 字典序下一个 k 组合
+      let i = k - 1;
+      while (i >= 0 && idx[i] === n - k + i) i--;
+      if (i < 0) break;
+      idx[i]++;
+      for (let j = i + 1; j < k; j++) idx[j] = idx[j - 1] + 1;
+    }
+    if (plans.length > 0 || truncated) {
+      return { status: 'ok', minFlips: k, plans, truncated };
+    }
+  }
+
+  return {
+    status: 'no-solution',
+    reason:
+      `在登记的阀门开闭状态基线上翻转至多 ${MAX_ANOMALY_FLIPS} 处阀门（开变关或关变开），` +
+      '仍无法同时解释全部现场有水 / 无水观测。请复核观测节点记录，或排查无阀管段是否发生断管、阀门数是否漏登。',
   };
 }
